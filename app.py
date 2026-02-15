@@ -2,7 +2,7 @@
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from pathlib import Path
 from typing import Dict, List
 
@@ -15,6 +15,7 @@ LOG_PATH = BASE_DIR / "events.jsonl"
 
 CATEGORIES = ["Research", "Study", "Coding", "FOMO", "Rest"]
 DEFAULT_CATEGORY = "Rest"
+SLEEP_GAP_SECONDS = 10  # treat large tick gaps as sleep/closed-lid time
 
 
 def now_local() -> datetime:
@@ -40,6 +41,7 @@ class FocusLedger(rumps.App):
         super().__init__(APP_NAME, title="…", quit_button="Quit")
         BASE_DIR.mkdir(parents=True, exist_ok=True)
         self.state = self._load_or_init_state()
+        self._last_tick_at = now_local()
 
         self.category_items = {}
         self.menu.add(rumps.MenuItem("Current: -", callback=None))
@@ -89,30 +91,21 @@ class FocusLedger(rumps.App):
     def _current_segment_seconds(self) -> float:
         return (now_local() - self._parse_iso(self.state.segment_started_at)).total_seconds()
 
-    def _day_session_seconds(self) -> float:
-        return (now_local() - self._parse_iso(self.state.day_session_started_at)).total_seconds()
+    def _effective_day_start(self) -> datetime:
+        now = now_local()
+        midnight = datetime.combine(now.date(), time.min, tzinfo=now.tzinfo)
+        manual_anchor = self._parse_iso(self.state.day_session_started_at)
+        return max(midnight, manual_anchor)
 
-    def _all_time_seconds(self) -> float:
-        total = 0.0
-        for e in self._events():
-            try:
-                st = self._parse_iso(e["start"])
-                ed = self._parse_iso(e["end"])
-            except Exception:
-                continue
-            if ed > st:
-                total += (ed - st).total_seconds()
-
-        # ongoing segment
-        st = self._parse_iso(self.state.segment_started_at)
-        ed = now_local()
-        if ed > st:
-            total += (ed - st).total_seconds()
-        return total
+    def _active_today_seconds(self) -> float:
+        start = self._effective_day_start()
+        now = now_local()
+        totals = self._aggregate(start, now)
+        return sum(totals.values())
 
     def _today_category_seconds(self, category: str) -> float:
         now = now_local()
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = self._effective_day_start()
         totals = self._aggregate(start, now)
         return totals.get(category, 0.0)
 
@@ -215,20 +208,47 @@ class FocusLedger(rumps.App):
         rumps.notification(APP_NAME, "Exported", str(out))
 
     def _reset_day_session(self, _):
-        t = now_local().isoformat()
+        now = now_local()
+        t = now.isoformat()
+
+        # close current segment so historical logs stay consistent
+        self._append_event(
+            category=self.state.current_category,
+            start_iso=self.state.segment_started_at,
+            end_iso=t,
+        )
+
+        # reset all visible counters
+        self.state.segment_started_at = t
         self.state.day_session_started_at = t
         self._save_state(self.state)
-        rumps.notification(APP_NAME, "Day Session", "Day session timer reset")
+        self._last_tick_at = now
+
+        rumps.notification(APP_NAME, "Day Session", "Reset complete (00:00 | 00:00 | 00:00)")
         self._refresh_ui()
 
+    def _exclude_sleep_gap_if_needed(self):
+        now = now_local()
+        gap = (now - self._last_tick_at).total_seconds()
+        self._last_tick_at = now
+
+        if gap <= SLEEP_GAP_SECONDS:
+            return
+
+        # shift ongoing segment forward by the slept duration
+        seg_start = self._parse_iso(self.state.segment_started_at)
+        self.state.segment_started_at = (seg_start + timedelta(seconds=gap)).isoformat()
+        self._save_state(self.state)
+
     def _tick(self, _):
+        self._exclude_sleep_gap_if_needed()
         self._refresh_ui()
 
     def _refresh_ui(self):
         cur = self.state.current_category
         seg = fmt_hm(self._current_segment_seconds())
         today_cur = fmt_hm(self._today_category_seconds(cur))
-        active = fmt_hm(self._all_time_seconds())
+        active = fmt_hm(self._active_today_seconds())
 
         short = {
             "Research": "🔬",
@@ -243,7 +263,7 @@ class FocusLedger(rumps.App):
         # first menu item is current status
         keys = list(self.menu.keys())
         if keys:
-            self.menu[keys[0]].title = f"Current: {cur} | Session: {seg} | Today({cur}): {today_cur} | Active: {active}"
+            self.menu[keys[0]].title = f"Current: {cur} | Session: {seg} | Today({cur}): {today_cur} | Active(today): {active}"
 
         for cat, item in self.category_items.items():
             item.state = 1 if cat == cur else 0
